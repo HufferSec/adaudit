@@ -137,6 +137,7 @@ Param (
     [switch]$authpolsilos    = $false,
     [switch]$insecurednszone = $false,
     [switch]$recentchanges   = $false,
+    [switch]$adcs            = $false,
     [switch]$all             = $false
 )
 $versionnum               = "v5.4"
@@ -1305,6 +1306,125 @@ Function Check-Shares {#Check SYSVOL and NETLOGON share exists
     }
 }
 
+Function Get-ADCSVulns {
+    $certutil_output = certutil -v -template
+    $certutil_lines = $certutil_output.Trim().Split("`n")
+    $templates = @()
+    foreach ($line in $certutil_lines) {
+        if ($line.StartsWith("Template[")) {
+            $template_unparsed = $current_template.TrimEnd(",").Split(",")
+            $SuppliesSubjectCheck = $false
+            $ClientAuthCheck = $false
+            $AllowEnrollCheck = $false
+            $AnyPurposeCheck = $false
+            $AllowWriteCheck = $false
+            $AllowFullControl = $false
+            $CertificateRequestAgentCheck = $false
+
+            $TemplatePropCommonName = $null
+            foreach ($detail in $template_unparsed) {
+                if ($detail -like "*TemplatePropCommonName =*") {
+                    $TemplatePropCommonName = $detail.Split("=")[1].Trim()
+                }
+                if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") {
+                    $SuppliesSubjectCheck = $true
+                }
+                if ($detail -like "*Client Authentication*") {
+                    $ClientAuthCheck = $true
+                }
+                if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") {
+                    $AllowEnrollCheck = $true
+                }
+                if ($detail -like "2.5.29.37.0 Any Purpose") {
+                    $AnyPurposeCheck = $true
+                }
+                if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") {
+                    $AllowWriteCheck = $true
+                }
+                # Check for Allow Full Control
+                if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") {
+                    $AllowFullControl = $true
+                }
+                if ($detail -like "Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)") {
+                    $CertificateRequestAgentCheck = $true
+                }
+                # Create object with details. Objectg name is TemplatePropCommonName
+                $template = New-Object -TypeName PSObject -Property @{
+                    "SuppliesSubjectCheck" = $SuppliesSubjectCheck
+                    "ClientAuthCheck" = $ClientAuthCheck
+                    "AllowEnrollCheck" = $AllowEnrollCheck
+                    "AnyPurposeCheck" = $AnyPurposeCheck
+                    "AllowWriteCheck" = $AllowWriteCheck
+                    "AllowFullControl" = $AllowFullControl
+                    "TemplatePropCommonName" = $TemplatePropCommonName
+                    "CertificateRequestAgentCheck" = $CertificateRequestAgentCheck
+                }
+            }
+            $templates += $template
+            $current_template = $line + ","
+        }
+        else {
+            $current_template += $line + ","
+        }
+    }
+
+    # Check for ESC1
+    # ESC1 = CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 1 and  Client Authentication and ( enroll or full control )
+    $ESC1 = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowEnrollCheck }
+    $ESC1 += ($templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowFullControl })
+    $ESC1 += ($templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowWriteCheck })
+    # Remove duplicates
+    $ESC1 = $ESC1 | Select-Object -Property TemplatePropCommonName -unique
+    $ESC2 = $templates | Where-Object { $_.AnyPurposeCheck -and $_.AllowEnrollCheck }
+    $ESC3 = $templates | Where-Object { $_.CertificateRequestAgentCheck -and $_.AllowEnrollCheck }
+    # ESC4 = allow write or allow full control = Authenticated Users or Domain Users
+    $ESC4 = $templates | Where-Object { $_.AllowWriteCheck -or $_.AllowFullControl }
+    # Foreach ESC1, ESC2, ESC3, ESC4 print out the TemplatePropCommonName
+    # output path = $outputdir\vulnerable_templates.txt
+    $template_path = $outputdir + "vulnerable_templates.txt"
+    $web_enrollmeent_path = $outputdir + "web_enrollment.txt"
+
+    foreach ($template in $ESC1) {
+        # example line = ESC1 Vulnerable Templates: test
+        $ESC1line = "ESC1 Vulnerable Templates:" + $template.TemplatePropCommonName
+        add-content -path $template_path -value $ESC1line
+        Write-Both '    [!]'$ESC1line
+    }
+    foreach ($template in $ESC2) {
+        $ESC2line = "ESC2 Vulnerable Templates:" + $template.TemplatePropCommonName
+        add-content -path $template_path -value $ESC2line
+        Write-Both '    [!]'$ESC2line
+    }
+    foreach ($template in $ESC3) {
+        $ESC3line = "ESC3 Vulnerable Templates:" + $template.TemplatePropCommonName
+        add-content -path $template_path -value $ESC3line
+        Write-Both '    [!]'$ESC3line
+    }
+    foreach ($template in $ESC4) {
+        $ESC4line = "ESC4 Vulnerable Templates:" + $template.TemplatePropCommonName
+        add-content -path $template_path -value $ESC4line
+        Write-Both '    [!]'$ESC4line
+    }
+    # ESC8 = invoke web request -uri ($certInfo | Select-String 'Server:' | Select-Object -First 1).ToString().Split(':')[1].Trim().Replace('"', '') -erroraction Stop
+    # If error and response is unauthorized, then vulnerable
+    try {
+        $certInfo = & certutil
+        $serverName = ($certInfo | Select-String 'Server:' | Select-Object -First 1).ToString().Split(':')[1].Trim().Replace('"', '')
+        $response = Invoke-WebRequest -Uri ("http://$serverName/certsrv/") -ErrorAction Stop
+        $response
+    }
+    catch {
+        # If error and response is unauthorized, then vulnerable
+        if ($_.Exception.Response.StatusCode -eq 401) {
+            Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
+            Write-Both "    [!] ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
+        }
+    }
+    # Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText("$outputdir\insecure_dns_zones.txt"))
+    Write-Nessus-Finding "Active Directory Certificate Service Web Enrollment Enabled in HTTP" "KB1095" ([System.IO.File]::ReadAllText("$outputdir\web_enrollment.txt"))
+    Write-Nessus-Finding "Active Directory Certificate Service Vulnerable Templates" "KB1096" ([System.IO.File]::ReadAllText("$outputdir\vulnerable_templates.txt"))
+}
+
 $outputdir  = (Get-Item -Path ".\").FullName + "\" + $env:computername
 $starttime  = Get-Date
 $scriptname = $MyInvocation.MyCommand.Name
@@ -1340,6 +1460,7 @@ if($laps -or $all)           { $running=$true ; Write-Both "[*] Check For Existe
 if($authpolsilos -or $all)   { $running=$true ; Write-Both "[*] Check For Existence of Authentication Polices and Silos" ; Get-AuthenticationPoliciesAndSilos }
 if($insecurednszone -or $all){ $running=$true ; Write-Both "[*] Check For Existence DNS Zones allowing insecure updates" ; Get-DNSZoneInsecure }
 if($recentchanges -or $all)  { $running=$true ; Write-Both "[*] Check For newly created users and groups"                ; Get-RecentChanges }
+if($adcs -or $all)           { $running=$true ; Write-Both "[*] Check For ADCS Vulnerabilities"                          ; Get-ADCSVulns }
 if(!$running){ Write-Both "[!] No arguments selected"
     Write-Both "[!] Other options are as follows, they can be used in combination"
     Write-Both "    -installdeps installs optionnal features (DSInternals)"
